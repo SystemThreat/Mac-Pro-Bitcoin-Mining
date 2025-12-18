@@ -1,21 +1,4 @@
-# Screenshots
 
-Add your screenshots here!
-
-## Suggested Screenshots
-
-1. **banner.png** - Project banner/logo (1200x400 recommended)
-2. **demo.png** - Screenshot of the miner running
-3. **share-found.png** - Screenshot showing a share being found
-
-## Creating a Banner
-
-You can create a simple banner with:
-- Canva (free)
-- Figma (free)
-- Or just use a screenshot of the terminal!
-
-## Text-Based Banner
 
 ```
 ╔═══════════════════════════════════════════════════════════════════════════════╗
