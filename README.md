@@ -122,7 +122,7 @@ cd macmetal-miner
 xcode-select --install
 
 # Compile
-swiftc -O -o BTCMiner main.swift -framework Metal -framework Foundation -framework Network
+swiftc -O -o BTCMiner main.swift -framework Metal -framework Foundation
 
 # Run
 ./BTCMiner bc1qYourBitcoinAddressHere
