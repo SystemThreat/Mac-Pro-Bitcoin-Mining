@@ -105,8 +105,8 @@ Let's be real about the math:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/macmetal-miner.git
-cd macmetal-miner
+git clone https://github.com/SystemThreat/Mac-Pro-Bitcoin-Mining.git
+cd Mac-Pro-Bitcoin-Mining
 
 # Build the miner
 ./build.sh
