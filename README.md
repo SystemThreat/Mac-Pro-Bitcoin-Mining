@@ -11,7 +11,7 @@
 ║   ╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝     ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝     ║
 ║                                                                               ║
 ║                    ₿ Bitcoin Solo Mining for macOS 🍎                         ║
-║                         Native Metal GPU Acceleration                          ║
+║                         Native Metal GPU Acceleration                         ║
 ║                                                                               ║
 ╚═══════════════════════════════════════════════════════════════════════════════╝
 ```
