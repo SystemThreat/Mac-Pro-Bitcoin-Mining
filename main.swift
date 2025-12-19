@@ -1,66 +1,39 @@
-//
-//  main.swift
-//  MacMetal Miner
-//
-//  Native Swift + Metal GPU Bitcoin Solo Miner for Apple Silicon
-//  Connects to solo.ckpool.org via Stratum protocol
-//
-//  MIT License - See LICENSE for details
-//
-
 import Foundation
 import Metal
-import Network
-import CommonCrypto
+import Darwin
 
-// ============================================================================
-// MARK: - ANSI Terminal Colors
-// ============================================================================
-
+// MARK: - ANSI Colors
 struct Colors {
     static let reset = "\u{001B}[0m"
     static let bold = "\u{001B}[1m"
     static let dim = "\u{001B}[2m"
-    
-    // Standard colors
     static let red = "\u{001B}[91m"
     static let green = "\u{001B}[92m"
     static let yellow = "\u{001B}[93m"
     static let blue = "\u{001B}[94m"
     static let magenta = "\u{001B}[95m"
     static let cyan = "\u{001B}[96m"
-    
-    // 256-color palette
     static let gold = "\u{001B}[38;5;220m"
     static let pink = "\u{001B}[38;5;198m"
     static let lime = "\u{001B}[38;5;118m"
     static let aqua = "\u{001B}[38;5;45m"
     static let orange = "\u{001B}[38;5;208m"
     static let violet = "\u{001B}[38;5;135m"
-    
-    // Terminal control
     static let clearScreen = "\u{001B}[2J"
     static let home = "\u{001B}[H"
     static let hideCursor = "\u{001B}[?25l"
     static let showCursor = "\u{001B}[?25h"
+    static let rainbow = [red, orange, yellow, green, cyan, blue, violet, pink]
 }
 
-// ============================================================================
-// MARK: - Mining Result Structure
-// ============================================================================
-
-/// Matches the Metal shader's MiningResult struct
+// MARK: - Mining Result
 struct MiningResult {
     var nonce: UInt32
     var hash: (UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32)
     var zeros: UInt32
 }
 
-// ============================================================================
 // MARK: - Stratum Job
-// ============================================================================
-
-/// Represents a mining job received from the pool
 struct StratumJob {
     var id: String
     var prevHash: String
@@ -73,20 +46,30 @@ struct StratumJob {
     var cleanJobs: Bool
 }
 
-// ============================================================================
-// MARK: - GPU Miner
-// ============================================================================
+// MARK: - Block Info
+struct BlockInfo {
+    var height: Int
+    var pool: String
+    var address: String
+    var reward: Double
+    var timestamp: Int
+}
 
-/// Metal GPU miner - handles all GPU communication
+// MARK: - Log Entry
+struct LogEntry {
+    var time: String
+    var icon: String
+    var color: String
+    var message: String
+}
+
+// MARK: - GPU Miner
 class GPUMiner {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
     let pipeline: MTLComputePipelineState
+    let batchSize: Int = 1024 * 1024 * 16  // 16M hashes per batch
     
-    /// Number of hashes per GPU dispatch (16 million)
-    let batchSize: Int = 1024 * 1024 * 16
-    
-    // Metal buffers
     var headerBuffer: MTLBuffer?
     var nonceBuffer: MTLBuffer?
     var hashCountBuffer: MTLBuffer?
@@ -94,45 +77,39 @@ class GPUMiner {
     var resultsBuffer: MTLBuffer?
     var targetBuffer: MTLBuffer?
     
-    /// Initialize the GPU miner
     init?() {
-        // Get the default Metal device (GPU)
         guard let device = MTLCreateSystemDefaultDevice() else {
-            print("\(Colors.red)❌ Metal not supported on this device\(Colors.reset)")
+            print("❌ Metal not supported")
             return nil
         }
         self.device = device
         
-        // Create command queue
         guard let queue = device.makeCommandQueue() else {
-            print("\(Colors.red)❌ Could not create Metal command queue\(Colors.reset)")
+            print("❌ Could not create command queue")
             return nil
         }
         self.commandQueue = queue
         
-        // Load and compile the Metal shader
-        let shaderPath = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appendingPathComponent("SHA256.metal")
-        
-        guard let shaderSource = try? String(contentsOf: shaderPath) else {
-            print("\(Colors.red)❌ Could not load SHA256.metal shader file\(Colors.reset)")
-            print("\(Colors.dim)   Make sure SHA256.metal is in the current directory\(Colors.reset)")
+        // Load shader
+        let shaderPath = NSString(string: "~/BTCMiner/SHA256.metal").expandingTildeInPath
+        guard let shaderSource = try? String(contentsOfFile: shaderPath) else {
+            print("❌ Could not load shader file")
             return nil
         }
         
         do {
             let library = try device.makeLibrary(source: shaderSource, options: nil)
             guard let function = library.makeFunction(name: "mine") else {
-                print("\(Colors.red)❌ Could not find 'mine' function in shader\(Colors.reset)")
+                print("❌ Could not find 'mine' function")
                 return nil
             }
             self.pipeline = try device.makeComputePipelineState(function: function)
         } catch {
-            print("\(Colors.red)❌ Shader compilation error: \(error)\(Colors.reset)")
+            print("❌ Shader compilation error: \(error)")
             return nil
         }
         
-        // Allocate Metal buffers
+        // Create buffers
         headerBuffer = device.makeBuffer(length: 76, options: .storageModeShared)
         nonceBuffer = device.makeBuffer(length: 4, options: .storageModeShared)
         hashCountBuffer = device.makeBuffer(length: 4, options: .storageModeShared)
@@ -141,44 +118,27 @@ class GPUMiner {
         targetBuffer = device.makeBuffer(length: 4, options: .storageModeShared)
         
         print("\(Colors.green)✅ GPU Initialized: \(device.name)\(Colors.reset)")
-        print("\(Colors.cyan)   Max threads/threadgroup: \(pipeline.maxTotalThreadsPerThreadgroup)\(Colors.reset)")
-        print("\(Colors.cyan)   Batch size: \(batchSize.formatted()) hashes/dispatch\(Colors.reset)")
     }
     
-    /// Mine a batch of nonces on the GPU
-    /// - Parameters:
-    ///   - header: 76-byte block header (without nonce)
-    ///   - nonceStart: Starting nonce value
-    ///   - targetZeros: Minimum zero bits for a share (default 32)
-    /// - Returns: Tuple of (total hashes computed, array of (nonce, zeros) for shares found)
     func mine(header: [UInt8], nonceStart: UInt32, targetZeros: UInt32 = 32) -> (hashes: UInt64, results: [(UInt32, UInt32)]) {
-        guard header.count == 76 else {
-            print("\(Colors.red)❌ Invalid header length: \(header.count) (expected 76)\(Colors.reset)")
-            return (0, [])
-        }
+        guard header.count == 76 else { return (0, []) }
         
-        // Copy header to GPU buffer
         memcpy(headerBuffer!.contents(), header, 76)
         
-        // Set starting nonce
         var nonce = nonceStart
         memcpy(nonceBuffer!.contents(), &nonce, 4)
         
-        // Reset counters
         memset(hashCountBuffer!.contents(), 0, 4)
         memset(resultCountBuffer!.contents(), 0, 4)
         
-        // Set target difficulty
         var target = targetZeros
         memcpy(targetBuffer!.contents(), &target, 4)
         
-        // Create command buffer and encoder
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             return (0, [])
         }
         
-        // Set up the compute pipeline
         encoder.setComputePipelineState(pipeline)
         encoder.setBuffer(headerBuffer, offset: 0, index: 0)
         encoder.setBuffer(nonceBuffer, offset: 0, index: 1)
@@ -187,23 +147,18 @@ class GPUMiner {
         encoder.setBuffer(resultsBuffer, offset: 0, index: 4)
         encoder.setBuffer(targetBuffer, offset: 0, index: 5)
         
-        // Calculate thread dispatch sizes
         let threadsPerGroup = min(pipeline.maxTotalThreadsPerThreadgroup, 256)
         let threadGroups = (batchSize + threadsPerGroup - 1) / threadsPerGroup
         
-        // Dispatch threads to GPU
         encoder.dispatchThreadgroups(
             MTLSize(width: threadGroups, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: threadsPerGroup, height: 1, depth: 1)
         )
         
         encoder.endEncoding()
-        
-        // Execute and wait for completion
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         
-        // Read results from GPU
         let hashCount = hashCountBuffer!.contents().load(as: UInt32.self)
         let resultCount = resultCountBuffer!.contents().load(as: UInt32.self)
         
@@ -220,133 +175,176 @@ class GPUMiner {
     }
 }
 
-// ============================================================================
-// MARK: - Stratum Client
-// ============================================================================
-
-/// Handles communication with the mining pool via Stratum protocol
+// MARK: - BSD Socket Stratum Client
 class StratumClient {
-    var socket: NWConnection?
+    var sockfd: Int32 = -1
     var extranonce1: String = ""
-    var extranonce2Size: Int = 4
+    var extranonce2Size: Int = 8
     var currentJob: StratumJob?
     var address: String
     var isConnected = false
+    var buffer = Data()
     
-    // Callbacks
     var onJobReceived: ((StratumJob) -> Void)?
     var onConnected: (() -> Void)?
+    var onLog: ((String, String, String) -> Void)?
     
     init(address: String) {
         self.address = address
     }
     
-    /// Connect to the mining pool
-    func connect() {
-        let host = NWEndpoint.Host("solo.ckpool.org")
-        let port = NWEndpoint.Port(rawValue: 3333)!
+    func connect() -> Bool {
+        onLog?("🌐", Colors.blue, "Connecting...")
         
-        socket = NWConnection(host: host, port: port, using: .tcp)
+        // DNS resolution
+        var hints = addrinfo()
+        hints.ai_family = AF_INET
+        hints.ai_socktype = SOCK_STREAM
+        hints.ai_protocol = IPPROTO_TCP
         
-        socket?.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .ready:
-                self?.isConnected = true
-                self?.subscribe()
-            case .failed(let error):
-                print("\(Colors.red)❌ Connection failed: \(error)\(Colors.reset)")
-                self?.isConnected = false
-            default:
-                break
-            }
+        var result: UnsafeMutablePointer<addrinfo>?
+        let status = getaddrinfo("solo.ckpool.org", "3333", &hints, &result)
+        
+        guard status == 0, let addrInfo = result else {
+            onLog?("❌", Colors.red, "DNS failed")
+            return false
+        }
+        defer { freeaddrinfo(result) }
+        
+        // Create socket
+        sockfd = socket(addrInfo.pointee.ai_family, addrInfo.pointee.ai_socktype, addrInfo.pointee.ai_protocol)
+        guard sockfd >= 0 else {
+            onLog?("❌", Colors.red, "Socket failed")
+            return false
         }
         
-        socket?.start(queue: .global())
-        receiveData()
+        // Set timeout
+        var timeout = timeval(tv_sec: 30, tv_usec: 0)
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        
+        // Connect
+        let connectResult = Darwin.connect(sockfd, addrInfo.pointee.ai_addr, addrInfo.pointee.ai_addrlen)
+        guard connectResult == 0 else {
+            close(sockfd)
+            sockfd = -1
+            onLog?("❌", Colors.red, "Connect failed")
+            return false
+        }
+        
+        isConnected = true
+        onLog?("✅", Colors.green, "Connected!")
+        return true
     }
     
-    /// Subscribe to mining notifications
-    private func subscribe() {
-        let msg = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"MacMetalMiner/1.0\"]}\n"
-        send(msg)
+    func disconnect() {
+        if sockfd >= 0 {
+            close(sockfd)
+            sockfd = -1
+        }
+        isConnected = false
     }
     
-    /// Authorize the worker
-    func authorize() {
-        let msg = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"\(address).metal\",\"x\"]}\n"
-        send(msg)
-    }
-    
-    /// Send a message to the pool
-    private func send(_ message: String) {
-        guard let data = message.data(using: .utf8) else { return }
-        socket?.send(content: data, completion: .contentProcessed { error in
-            if let error = error {
-                print("\(Colors.red)❌ Send error: \(error)\(Colors.reset)")
-            }
-        })
-    }
-    
-    /// Receive data from the pool
-    private func receiveData() {
-        socket?.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] content, _, isComplete, error in
-            if let data = content, let str = String(data: data, encoding: .utf8) {
-                self?.handleMessage(str)
-            }
-            if !isComplete {
-                self?.receiveData()
-            }
+    func send(_ message: String) -> Bool {
+        guard sockfd >= 0 else { return false }
+        let data = message.data(using: .utf8)!
+        return data.withUnsafeBytes { ptr in
+            Darwin.send(sockfd, ptr.baseAddress, data.count, 0) == data.count
         }
     }
     
-    /// Handle incoming messages from the pool
-    private func handleMessage(_ message: String) {
-        for line in message.split(separator: "\n") {
-            guard let data = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                continue
-            }
-            
-            // Handle subscription response
-            if let result = json["result"] as? [Any], result.count >= 2 {
-                if let details = result[0] as? [[Any]], !details.isEmpty {
-                    extranonce1 = result[1] as? String ?? ""
-                    extranonce2Size = result[2] as? Int ?? 4
-                    authorize()
-                }
-            }
-            
-            // Handle job notification
-            if let method = json["method"] as? String, method == "mining.notify",
-               let params = json["params"] as? [Any], params.count >= 9 {
-                let job = StratumJob(
-                    id: params[0] as? String ?? "",
-                    prevHash: params[1] as? String ?? "",
-                    coinbase1: params[2] as? String ?? "",
-                    coinbase2: params[3] as? String ?? "",
-                    merkleBranches: params[4] as? [String] ?? [],
-                    version: params[5] as? String ?? "",
-                    nbits: params[6] as? String ?? "",
-                    ntime: params[7] as? String ?? "",
-                    cleanJobs: params[8] as? Bool ?? false
-                )
-                currentJob = job
-                onJobReceived?(job)
-            }
-            
-            // Handle authorization response
-            if let id = json["id"] as? Int, id == 2, let result = json["result"] as? Bool, result {
-                onConnected?()
-            }
+    func receive() -> [String] {
+        guard sockfd >= 0 else { return [] }
+        
+        var buf = [UInt8](repeating: 0, count: 4096)
+        let bytesRead = recv(sockfd, &buf, buf.count, 0)
+        
+        if bytesRead <= 0 {
+            return []
         }
+        
+        buffer.append(contentsOf: buf[0..<bytesRead])
+        
+        var messages: [String] = []
+        while let newlineIndex = buffer.firstIndex(of: 0x0A) {
+            let lineData = buffer[buffer.startIndex..<newlineIndex]
+            if let line = String(data: lineData, encoding: .utf8), !line.isEmpty {
+                messages.append(line)
+            }
+            buffer.removeSubrange(buffer.startIndex...newlineIndex)
+        }
+        
+        return messages
+    }
+    
+    func subscribe() -> Bool {
+        let msg = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"MacMetal/7.4\"]}\n"
+        return send(msg)
+    }
+    
+    func authorize() -> Bool {
+        let msg = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"\(address).gpu\",\"x\"]}\n"
+        return send(msg)
+    }
+    
+    func handleMessages() {
+        let messages = receive()
+        for message in messages {
+            parseMessage(message)
+        }
+    }
+    
+    func parseMessage(_ message: String) {
+        guard let data = message.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return
+        }
+        
+        // Handle subscription response
+        if let id = json["id"] as? Int, id == 1,
+           let result = json["result"] as? [Any], result.count >= 3 {
+            extranonce1 = result[1] as? String ?? ""
+            extranonce2Size = result[2] as? Int ?? 8
+            _ = authorize()
+        }
+        
+        // Handle authorization
+        if let id = json["id"] as? Int, id == 2, let result = json["result"] as? Bool, result {
+            onLog?("🔑", Colors.green, "Authorized!")
+            onConnected?()
+        }
+        
+        // Handle job notification
+        if let method = json["method"] as? String, method == "mining.notify",
+           let params = json["params"] as? [Any], params.count >= 9 {
+            let job = StratumJob(
+                id: params[0] as? String ?? "",
+                prevHash: params[1] as? String ?? "",
+                coinbase1: params[2] as? String ?? "",
+                coinbase2: params[3] as? String ?? "",
+                merkleBranches: params[4] as? [String] ?? [],
+                version: params[5] as? String ?? "",
+                nbits: params[6] as? String ?? "",
+                ntime: params[7] as? String ?? "",
+                cleanJobs: params[8] as? Bool ?? false
+            )
+            currentJob = job
+            onJobReceived?(job)
+        }
+    }
+    
+    func reconnect() -> Bool {
+        disconnect()
+        Thread.sleep(forTimeInterval: 3)
+        if connect() {
+            _ = subscribe()
+            return true
+        }
+        return false
     }
 }
 
-// ============================================================================
 // MARK: - Helper Functions
-// ============================================================================
-
-/// Convert hex string to byte array
 func hexToBytes(_ hex: String) -> [UInt8] {
     var bytes: [UInt8] = []
     var index = hex.startIndex
@@ -360,102 +358,85 @@ func hexToBytes(_ hex: String) -> [UInt8] {
     return bytes
 }
 
-/// Double SHA256 hash
 func sha256d(_ data: [UInt8]) -> [UInt8] {
     var digest1 = [UInt8](repeating: 0, count: 32)
     var digest2 = [UInt8](repeating: 0, count: 32)
     
-    _ = data.withUnsafeBytes { ptr in
-        CC_SHA256(ptr.baseAddress, CC_LONG(data.count), &digest1)
-    }
-    _ = digest1.withUnsafeBytes { ptr in
-        CC_SHA256(ptr.baseAddress, CC_LONG(32), &digest2)
-    }
+    var ctx1 = CC_SHA256_CTX()
+    CC_SHA256_Init(&ctx1)
+    CC_SHA256_Update(&ctx1, data, CC_LONG(data.count))
+    CC_SHA256_Final(&digest1, &ctx1)
+    
+    var ctx2 = CC_SHA256_CTX()
+    CC_SHA256_Init(&ctx2)
+    CC_SHA256_Update(&ctx2, digest1, 32)
+    CC_SHA256_Final(&digest2, &ctx2)
     
     return digest2
 }
 
-/// Build the block header from a Stratum job
+// CommonCrypto bridge
+typealias CC_LONG = UInt32
+struct CC_SHA256_CTX {
+    var count: (UInt32, UInt32) = (0, 0)
+    var state: (UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32) = (0, 0, 0, 0, 0, 0, 0, 0)
+    var buffer: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                 UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                 UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                 UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                 UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                 UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                 UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                 UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+}
+
+@_silgen_name("CC_SHA256_Init")
+func CC_SHA256_Init(_ ctx: UnsafeMutablePointer<CC_SHA256_CTX>) -> Int32
+
+@_silgen_name("CC_SHA256_Update")
+func CC_SHA256_Update(_ ctx: UnsafeMutablePointer<CC_SHA256_CTX>, _ data: UnsafeRawPointer, _ len: CC_LONG) -> Int32
+
+@_silgen_name("CC_SHA256_Final")
+func CC_SHA256_Final(_ digest: UnsafeMutablePointer<UInt8>, _ ctx: UnsafeMutablePointer<CC_SHA256_CTX>) -> Int32
+
 func buildHeader(job: StratumJob, extranonce1: String, extranonce2: String) -> [UInt8] {
-    // Build coinbase transaction
     let coinbaseHex = job.coinbase1 + extranonce1 + extranonce2 + job.coinbase2
     let coinbase = hexToBytes(coinbaseHex)
     
-    // Calculate merkle root
     var merkle = sha256d(coinbase)
     for branch in job.merkleBranches {
         merkle = sha256d(merkle + hexToBytes(branch))
     }
     
-    // Build 76-byte header (without nonce)
     var header: [UInt8] = []
     
-    // Version (4 bytes, little-endian)
     let version = UInt32(job.version, radix: 16) ?? 0
     header += withUnsafeBytes(of: version.littleEndian) { Array($0) }
     
-    // Previous block hash (32 bytes, reversed)
     let prevHash = hexToBytes(job.prevHash)
     header += prevHash.reversed()
     
-    // Merkle root (32 bytes, reversed)
     header += merkle.reversed()
     
-    // Timestamp (4 bytes, little-endian)
     let ntime = UInt32(job.ntime, radix: 16) ?? 0
     header += withUnsafeBytes(of: ntime.littleEndian) { Array($0) }
     
-    // Bits/difficulty target (4 bytes, little-endian)
     let nbits = hexToBytes(job.nbits)
     header += nbits.reversed()
     
     return header
 }
 
-/// Play a sound effect
-func playSound(_ type: String) {
-    let sounds: [String: String] = [
-        "share": "/System/Library/Sounds/Glass.aiff",
-        "block": "/System/Library/Sounds/Blow.aiff",
-        "connect": "/System/Library/Sounds/Funk.aiff",
-        "start": "/System/Library/Sounds/Purr.aiff"
-    ]
-    if let path = sounds[type] {
-        Process.launchedProcess(launchPath: "/usr/bin/afplay", arguments: ["-v", "1", path])
-    }
-}
-
-/// Format a number with commas
-extension UInt64 {
-    func formatted() -> String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        return formatter.string(from: NSNumber(value: self)) ?? "\(self)"
-    }
-}
-
-extension Int {
-    func formatted() -> String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        return formatter.string(from: NSNumber(value: self)) ?? "\(self)"
-    }
-}
-
-// ============================================================================
-// MARK: - Bitcoin Miner
-// ============================================================================
-
-/// Main miner class - coordinates GPU, network, and UI
+// MARK: - Main Miner Class
 class BitcoinMiner {
     let gpu: GPUMiner
     let stratum: StratumClient
     let address: String
     
-    // Statistics
     var totalHashes: UInt64 = 0
     var sessionShares: Int = 0
     var allTimeShares: Int = 0
+    var blockShares: Int = 0
     var bestDiff: UInt32 = 0
     var startTime: Date
     var lastShareTime: Date?
@@ -464,11 +445,18 @@ class BitcoinMiner {
     var blockTime: Date = Date()
     var isRunning = true
     var currentNonce: UInt32 = 0
+    var reconnects: Int = 0
+    var disconnects: Int = 0
     
-    // Satoshi quotes
+    var soloWinners: [BlockInfo] = []
+    var recentBlocks: [BlockInfo] = []
+    var logEntries: [LogEntry] = []
+    
     let quotes = [
         "The Times 03/Jan/2009 Chancellor on brink of second bailout",
         "If you don't believe it or don't get it, I don't have time to convince you",
+        "Lost coins only make everyone else's coins worth slightly more",
+        "It might make sense just to get some in case it catches on",
         "One CPU one vote",
         "Be your own bank",
         "Not your keys, not your coins",
@@ -477,7 +465,9 @@ class BitcoinMiner {
         "Running bitcoin - Hal Finney"
     ]
     
-    /// Initialize the miner
+    let genesisTime = 1231006505
+    let halvingBlock = 1050000
+    
     init?(address: String) {
         guard let gpu = GPUMiner() else { return nil }
         self.gpu = gpu
@@ -489,9 +479,8 @@ class BitcoinMiner {
         setupStratum()
     }
     
-    /// Load cumulative shares from disk
     func loadShares() -> Int {
-        let path = NSString(string: "~/.macmetal_shares.json").expandingTildeInPath
+        let path = NSString(string: "~/.btc_shares.json").expandingTildeInPath
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let total = json["total"] as? Int else {
@@ -500,110 +489,173 @@ class BitcoinMiner {
         return total
     }
     
-    /// Save cumulative shares to disk
     func saveShares() {
-        let path = NSString(string: "~/.macmetal_shares.json").expandingTildeInPath
-        let json: [String: Any] = [
-            "total": allTimeShares,
-            "updated": ISO8601DateFormatter().string(from: Date())
-        ]
+        let path = NSString(string: "~/.btc_shares.json").expandingTildeInPath
+        let json: [String: Any] = ["total": allTimeShares, "updated": ISO8601DateFormatter().string(from: Date())]
         if let data = try? JSONSerialization.data(withJSONObject: json) {
             try? data.write(to: URL(fileURLWithPath: path))
         }
     }
     
-    /// Set up Stratum callbacks
+    func addLog(_ icon: String, _ color: String, _ message: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        let entry = LogEntry(time: formatter.string(from: Date()), icon: icon, color: color, message: message)
+        logEntries.append(entry)
+        if logEntries.count > 3 {
+            logEntries.removeFirst()
+        }
+    }
+    
     func setupStratum() {
+        stratum.onLog = { [weak self] icon, color, message in
+            self?.addLog(icon, color, message)
+        }
+        
         stratum.onConnected = { [weak self] in
-            self?.log("🔑", Colors.green, "Authorized!")
-            self?.fetchPrice()
+            self?.fetchData()
         }
         
         stratum.onJobReceived = { [weak self] job in
             if job.cleanJobs {
                 self?.blockTime = Date()
-                self?.log("🧱", Colors.orange, "NEW BLOCK!")
-                playSound("block")
+                self?.blockShares = 0
+                self?.addLog("🧱", Colors.orange, "NEW BLOCK!")
+                self?.playSound("block")
+                self?.fetchData()
             }
         }
     }
     
-    /// Log a message
-    func log(_ icon: String, _ color: String, _ message: String) {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        let time = formatter.string(from: Date())
-        print("\(Colors.dim)\(time)\(Colors.reset)  \(icon)  \(color)\(message)\(Colors.reset)")
+    func playSound(_ type: String) {
+        let sounds: [String: String] = [
+            "share": "/System/Library/Sounds/Glass.aiff",
+            "block": "/System/Library/Sounds/Blow.aiff",
+            "connect": "/System/Library/Sounds/Funk.aiff",
+            "start": "/System/Library/Sounds/Purr.aiff"
+        ]
+        if let path = sounds[type] {
+            DispatchQueue.global().async {
+                let task = Process()
+                task.launchPath = "/usr/bin/afplay"
+                task.arguments = ["-v", "1", path]
+                try? task.run()
+            }
+        }
     }
     
-    /// Fetch current BTC price
+    func fetchData() {
+        DispatchQueue.global().async { [weak self] in
+            self?.fetchPrice()
+            self?.fetchSoloWinners()
+            self?.fetchRecentBlocks()
+        }
+    }
+    
     func fetchPrice() {
         guard let url = URL(string: "https://api.coinbase.com/v2/prices/BTC-USD/spot") else { return }
-        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
-            if let data = data,
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let dataObj = json["data"] as? [String: Any],
-               let amount = dataObj["amount"] as? String,
-               let price = Double(amount) {
-                self?.btcPrice = price
-            }
-        }.resume()
+        if let data = try? Data(contentsOf: url),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let dataObj = json["data"] as? [String: Any],
+           let amount = dataObj["amount"] as? String,
+           let price = Double(amount) {
+            btcPrice = price
+        }
     }
     
-    /// Main entry point
+    func fetchSoloWinners() {
+        guard let url = URL(string: "https://mempool.space/api/v1/mining/pool/solock/blocks") else { return }
+        if let data = try? Data(contentsOf: url),
+           let blocks = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            soloWinners = blocks.prefix(7).compactMap { block in
+                guard let height = block["height"] as? Int,
+                      let timestamp = block["timestamp"] as? Int,
+                      let extras = block["extras"] as? [String: Any] else { return nil }
+                let pool = (extras["pool"] as? [String: Any])?["name"] as? String ?? "Solo"
+                let addr = extras["coinbaseAddress"] as? String ?? "?"
+                let fees = (extras["totalFees"] as? Double ?? 0) / 100_000_000
+                return BlockInfo(height: height, pool: pool, address: addr, reward: 3.125 + fees, timestamp: timestamp)
+            }
+        }
+    }
+    
+    func fetchRecentBlocks() {
+        guard let url = URL(string: "https://mempool.space/api/v1/blocks") else { return }
+        if let data = try? Data(contentsOf: url),
+           let blocks = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            recentBlocks = blocks.prefix(7).compactMap { block in
+                guard let height = block["height"] as? Int,
+                      let timestamp = block["timestamp"] as? Int,
+                      let extras = block["extras"] as? [String: Any] else { return nil }
+                let pool = (extras["pool"] as? [String: Any])?["name"] as? String ?? "?"
+                let addr = extras["coinbaseAddress"] as? String ?? "?"
+                let fees = (extras["totalFees"] as? Double ?? 0) / 100_000_000
+                return BlockInfo(height: height, pool: pool, address: addr, reward: 3.125 + fees, timestamp: timestamp)
+            }
+            if let first = recentBlocks.first {
+                blockHeight = first.height
+            }
+        }
+    }
+    
     func run() {
-        // Hide cursor and start
-        print(Colors.hideCursor)
-        print("\n\(Colors.gold)  ₿ MacMetal Miner - Bitcoin Solo Mining for macOS ⛏️\(Colors.reset)\n")
-        
+        print("\(Colors.hideCursor)")
         playSound("start")
         
-        log("🌐", Colors.blue, "Connecting to solo.ckpool.org:3333...")
-        stratum.connect()
-        
-        // Wait for connection
-        while !stratum.isConnected {
-            Thread.sleep(forTimeInterval: 0.1)
+        // Connect
+        guard stratum.connect() else {
+            print("❌ Failed to connect")
+            return
         }
-        
-        log("✅", Colors.green, "Connected!")
         playSound("connect")
         
-        // Start mining on background thread
+        _ = stratum.subscribe()
+        
+        // Receiver thread
+        DispatchQueue.global().async { [weak self] in
+            while self?.isRunning == true {
+                self?.stratum.handleMessages()
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+        }
+        
+        // Mining thread
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             self?.miningLoop()
         }
         
-        // UI loop on main thread
+        // Data update thread
+        DispatchQueue.global().async { [weak self] in
+            while self?.isRunning == true {
+                self?.fetchData()
+                Thread.sleep(forTimeInterval: 30)
+            }
+        }
+        
+        // UI loop
         while isRunning {
             updateUI()
-            Thread.sleep(forTimeInterval: 0.5)
+            Thread.sleep(forTimeInterval: 0.4)
         }
     }
     
-    /// Main mining loop
     func miningLoop() {
         while isRunning {
-            guard let job = stratum.currentJob else {
+            guard stratum.isConnected, let job = stratum.currentJob else {
                 Thread.sleep(forTimeInterval: 0.1)
                 continue
             }
             
-            // Generate random extranonce2
             let extranonce2 = String(format: "%0\(stratum.extranonce2Size * 2)x", arc4random())
-            
-            // Build block header
             let header = buildHeader(job: job, extranonce1: stratum.extranonce1, extranonce2: extranonce2)
             
             guard header.count == 76 else { continue }
             
-            // Mine batch on GPU
             let (hashes, results) = gpu.mine(header: header, nonceStart: currentNonce, targetZeros: 32)
             
             totalHashes += hashes
             currentNonce = currentNonce &+ UInt32(gpu.batchSize)
             
-            // Process results
             for (nonce, zeros) in results {
                 if zeros > bestDiff {
                     bestDiff = zeros
@@ -612,21 +664,20 @@ class BitcoinMiner {
                 if zeros >= 32 {
                     sessionShares += 1
                     allTimeShares += 1
+                    blockShares += 1
                     lastShareTime = Date()
                     saveShares()
-                    log("💰", Colors.gold, "SHARE FOUND! Difficulty: \(zeros) bits 🎉")
+                    addLog("💰", Colors.gold, "SHARE! Zeros: \(zeros) 🎉")
                     playSound("share")
                 }
             }
         }
     }
     
-    /// Update terminal UI
     func updateUI() {
         let elapsed = Date().timeIntervalSince(startTime)
         let hashrate = Double(totalHashes) / max(elapsed, 1)
         
-        // Format hashrate
         let hrStr: String
         let hrColor: String
         if hashrate > 1_000_000_000 {
@@ -643,7 +694,6 @@ class BitcoinMiner {
             hrColor = Colors.cyan
         }
         
-        // Calculate stats
         let jackpot = 3.125 * max(btcPrice, 100000)
         let satsPerDollar = 100_000_000 / max(btcPrice, 1)
         let odds = hashrate / 800_000_000_000_000_000
@@ -652,6 +702,7 @@ class BitcoinMiner {
         let blockElapsed = Int(Date().timeIntervalSince(blockTime))
         let blockMin = blockElapsed / 60
         let blockSec = blockElapsed % 60
+        let blockColor = blockElapsed < 300 ? Colors.lime : (blockElapsed < 600 ? Colors.yellow : (blockElapsed < 900 ? Colors.orange : Colors.pink))
         
         let lastShareStr: String
         if let lastShare = lastShareTime {
@@ -661,88 +712,115 @@ class BitcoinMiner {
             lastShareStr = "--"
         }
         
-        let quoteIndex = Int(elapsed) / 30 % quotes.count
-        let quote = quotes[quoteIndex]
-        
-        let hours = Int(elapsed) / 3600
-        let minutes = (Int(elapsed) % 3600) / 60
-        let seconds = Int(elapsed) % 60
-        let uptime = String(format: "%d:%02d:%02d", hours, minutes, seconds)
-        
+        let sharesPerHour = elapsed > 60 ? Double(sessionShares) / (elapsed / 3600) : 0
+        let quote = quotes[Int(elapsed) / 30 % quotes.count]
+        let uptime = formatDuration(elapsed)
         let elecCost = (120.0 / 1000.0) * (elapsed / 3600.0) * 0.21
+        let halvingBlocks = halvingBlock - blockHeight
+        let btcAge = Double(Int(Date().timeIntervalSince1970) - genesisTime) / 86400 / 365.25
         
-        // Build output
-        var output = ""
-        output += "\(Colors.home)\(Colors.clearScreen)"
+        let connStr = stratum.isConnected ? "\(Colors.lime)● LIVE\(Colors.reset)" : "\(Colors.red)● OFFLINE\(Colors.reset)"
+        
+        var output = "\u{001B}[H\u{001B}[2J\u{001B}[3J"
+        
+        // Header
         output += "\(Colors.gold)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\(Colors.reset)\n"
-        output += "  \(Colors.bold)\(Colors.gold)₿ MacMetal Miner v1.0\(Colors.reset)  \(Colors.pink)🎮 METAL GPU\(Colors.reset)  \(Colors.lime)● LIVE\(Colors.reset)  \(hrColor)⚡ \(hrStr)\(Colors.reset)  \(Colors.aqua)🧱 Block\(Colors.reset)\n"
+        output += "  \(Colors.bold)\(Colors.gold)₿ BITCOIN LOTTERY v7.4\(Colors.reset)  \(Colors.pink)🎮 METAL GPU\(Colors.reset)  \(connStr)  \(hrColor)⚡ \(hrStr)\(Colors.reset)  \(Colors.aqua)🧱 #\(blockHeight)\(Colors.reset)  \(Colors.orange)⛏️\(Colors.reset)\n"
         output += "  \(Colors.gold)💰 $\(String(format: "%.2f", btcPrice))\(Colors.reset)    \(Colors.lime)🪙 \(Int(satsPerDollar)) sats/$1\(Colors.reset)    \(Colors.pink)🎰 Jackpot: $\(String(format: "%.0f", jackpot))\(Colors.reset)    \(Colors.dim)🎲 Odds: \(oddsStr)\(Colors.reset)\n"
         output += "\(Colors.gold)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\(Colors.reset)\n"
         
-        output += "  \(Colors.dim)🎯 Best Diff:\(Colors.reset) \(Colors.lime)\(bestDiff)\(Colors.reset)    \(Colors.dim)💸 Cost:\(Colors.reset) \(Colors.red)$\(String(format: "%.4f", elecCost))\(Colors.reset)    \(Colors.dim)⏱️ Uptime:\(Colors.reset) \(Colors.aqua)\(uptime)\(Colors.reset)\n"
+        // Stats
+        output += "  \(Colors.dim)🎯 Best Diff:\(Colors.reset) \(Colors.lime)\(bestDiff)\(Colors.reset)    \(Colors.dim)💸 Cost:\(Colors.reset) \(Colors.red)$\(String(format: "%.4f", elecCost))\(Colors.reset)    \(Colors.dim)⏱️ Uptime:\(Colors.reset) \(Colors.aqua)\(uptime)\(Colors.reset)    \(Colors.dim)⏳ Halving:\(Colors.reset) \(Colors.pink)\(formatNumber(halvingBlocks)) blocks\(Colors.reset)\n"
+        output += "  \(Colors.dim)Times Reconnected:\(Colors.reset) \(Colors.yellow)\(reconnects)\(Colors.reset)    \(Colors.dim)Times Disconnected:\(Colors.reset) \(Colors.orange)\(disconnects)\(Colors.reset)\n"
         output += "  \(Colors.dim)💬 \"\(quote)\"\(Colors.reset)\n\n"
         
+        // Hashrate & Shares
         output += "\(Colors.magenta)── ⚡ HASHRATE & SHARES ──────────────────────────────────────────────────────────────────────\(Colors.reset)\n"
-        output += "  \(Colors.gold)Speed:\(Colors.reset) \(hrColor)\(hrStr)\(Colors.reset)    \(Colors.gold)Hashes:\(Colors.reset) \(Colors.yellow)\(totalHashes.formatted())\(Colors.reset)    \(Colors.gold)Session:\(Colors.reset) \(Colors.lime)\(sessionShares)\(Colors.reset)    \(Colors.gold)Total:\(Colors.reset) \(Colors.pink)\(allTimeShares)\(Colors.reset)    \(Colors.gold)Last:\(Colors.reset) \(Colors.cyan)\(lastShareStr)\(Colors.reset)\n\n"
+        output += "  \(Colors.gold)Speed:\(Colors.reset) \(hrColor)\(hrStr)\(Colors.reset)    \(Colors.gold)Hashes:\(Colors.reset) \(Colors.yellow)\(formatNumber(Int(totalHashes)))\(Colors.reset)    \(Colors.gold)Block:\(Colors.reset) \(Colors.yellow)\(blockShares)\(Colors.reset)    \(Colors.gold)Session:\(Colors.reset) \(Colors.lime)\(sessionShares)\(Colors.reset)    \(Colors.gold)Total:\(Colors.reset) \(Colors.pink)\(allTimeShares)\(Colors.reset)    \(Colors.gold)Rate:\(Colors.reset) \(Colors.aqua)\(String(format: "%.1f", sharesPerHour))/hr\(Colors.reset)    \(Colors.gold)Last:\(Colors.reset) \(Colors.cyan)\(lastShareStr)\(Colors.reset)\n\n"
         
-        output += "\(Colors.violet)── ⏱️ BLOCK ─────────────────────────────────────────────────────────────────────────────────\(Colors.reset)\n"
-        output += "  ⏱️ \(String(format: "%02d:%02d", blockMin, blockSec)) since block\n\n"
+        // Block Timer
+        output += "\(Colors.violet)── ⏱️ BLOCK #\(blockHeight) ─────────────────────────────────────────────────────────────────────────────────\(Colors.reset)\n"
+        output += "  \(blockColor)⏱️ \(String(format: "%02d:%02d", blockMin, blockSec)) since block\(Colors.reset)\n\n"
         
-        output += "\(Colors.pink)── 🎮 GPU STATUS ────────────────────────────────────────────────────────────────────────────\(Colors.reset)\n"
-        output += "  \(Colors.lime)✅ Metal GPU Active\(Colors.reset)    \(Colors.dim)Device:\(Colors.reset) \(Colors.aqua)\(gpu.device.name)\(Colors.reset)    \(Colors.dim)Batch:\(Colors.reset) \(Colors.yellow)\(gpu.batchSize.formatted())\(Colors.reset)\n\n"
+        // GPU Status
+        output += "\(Colors.pink)── 🎮 GPU STATUS ─────────────────────────────────────────────────────────────────────────────\(Colors.reset)\n"
+        output += "  \(Colors.lime)✅ Metal GPU Active\(Colors.reset)    \(Colors.dim)Device:\(Colors.reset) \(Colors.aqua)\(gpu.device.name)\(Colors.reset)    \(Colors.dim)Batch:\(Colors.reset) \(Colors.yellow)\(formatNumber(gpu.batchSize))\(Colors.reset)\n\n"
         
-        output += "  \(Colors.dim)₿ \(address)    ⌨️ Ctrl+C to exit\(Colors.reset)\n"
+        // Solo Winners
+        output += "\(Colors.gold)── ⭐ SOLO WINNERS ───────────────────────────────────────────────────────────────────────────\(Colors.reset)\n"
+        output += "  \(Colors.dim)\("BLOCK".padding(toLength: 10, withPad: " ", startingAt: 0))  \("ADDRESS".padding(toLength: 44, withPad: " ", startingAt: 0))  \("REWARD".padding(toLength: 10, withPad: " ", startingAt: 0))  \("VALUE".padding(toLength: 12, withPad: " ", startingAt: 0))  AGO\(Colors.reset)\n"
+        for winner in soloWinners.prefix(7) {
+            let ago = (Int(Date().timeIntervalSince1970) - winner.timestamp) / 86400
+            let usd = winner.reward * max(btcPrice, 100000)
+            let addrShort = String(winner.address.prefix(43))
+            output += "  \(Colors.aqua)#\(String(winner.height).padding(toLength: 9, withPad: " ", startingAt: 0))\(Colors.reset)  \(Colors.yellow)\(addrShort.padding(toLength: 44, withPad: " ", startingAt: 0))\(Colors.reset)  \(Colors.lime)\(String(format: "%.3f", winner.reward).padding(toLength: 9, withPad: " ", startingAt: 0))₿\(Colors.reset)  \(Colors.green)$\(String(format: "%.0f", usd).padding(toLength: 11, withPad: " ", startingAt: 0))\(Colors.reset)  \(Colors.dim)\(String(format: "%3d", ago))d\(Colors.reset)\n"
+        }
+        output += "\n"
         
-        print(output)
+        // Last 7 Blocks
+        output += "\(Colors.orange)── 🧱 LAST 7 BLOCKS ──────────────────────────────────────────────────────────────────────────\(Colors.reset)\n"
+        output += "  \(Colors.dim)\("BLOCK".padding(toLength: 10, withPad: " ", startingAt: 0))  \("POOL".padding(toLength: 14, withPad: " ", startingAt: 0))  \("MINER ADDRESS".padding(toLength: 40, withPad: " ", startingAt: 0))  \("REWARD".padding(toLength: 10, withPad: " ", startingAt: 0))  T\(Colors.reset)\n"
+        for block in recentBlocks.prefix(7) {
+            let poolShort = String(block.pool.prefix(13))
+            let addrShort = String(block.address.prefix(39))
+            let isSolo = block.pool.contains("Solo") || block.pool.contains("CK")
+            let icon = isSolo ? "⭐" : "⛏"
+            output += "  \(Colors.aqua)#\(String(block.height).padding(toLength: 9, withPad: " ", startingAt: 0))\(Colors.reset)  \(Colors.yellow)\(poolShort.padding(toLength: 14, withPad: " ", startingAt: 0))\(Colors.reset)  \(Colors.dim)\(addrShort.padding(toLength: 40, withPad: " ", startingAt: 0))\(Colors.reset)  \(Colors.gold)\(String(format: "%.3f", block.reward).padding(toLength: 9, withPad: " ", startingAt: 0))₿\(Colors.reset)  \(icon)\n"
+        }
+        output += "\n"
+        
+        // Log
+        output += "\(Colors.green)── 📜 LOG ───────────────────────────────────────────────────────────────────────────────────\(Colors.reset)\n"
+        for entry in logEntries {
+            output += "  \(Colors.dim)\(entry.time)\(Colors.reset)  \(entry.icon)  \(entry.color)\(entry.message)\(Colors.reset)\n"
+        }
+        output += "\n"
+        
+        // Footer
+        output += "  \(Colors.dim)₿ \(address)    🎂 \(String(format: "%.1f", btcAge)) years    📰 \"The Times 03/Jan/2009\"    ⌨️ Ctrl+C\(Colors.reset)\n"
+        
+        FileHandle.standardOutput.write(output.data(using: .utf8)!)
+        fflush(stdout)
+    }
+    
+    func formatDuration(_ seconds: Double) -> String {
+        let h = Int(seconds) / 3600
+        let m = (Int(seconds) % 3600) / 60
+        let s = Int(seconds) % 60
+        return String(format: "%d:%02d:%02d", h, m, s)
+    }
+    
+    func formatNumber(_ n: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter.string(from: NSNumber(value: n)) ?? "\(n)"
     }
 }
 
-// ============================================================================
-// MARK: - Main Entry Point
-// ============================================================================
-
-// Parse command line arguments
+// MARK: - Main
 let args = CommandLine.arguments
 guard args.count >= 2 else {
-    print("""
-    \(Colors.gold)₿ MacMetal Miner - Bitcoin Solo Mining for macOS\(Colors.reset)
-    
-    \(Colors.bold)Usage:\(Colors.reset) ./BTCMiner <BITCOIN_ADDRESS>
-    
-    \(Colors.bold)Example:\(Colors.reset)
-      ./BTCMiner bc1qYourBitcoinAddressHere
-    
-    \(Colors.bold)Requirements:\(Colors.reset)
-      - macOS 14.0 or later
-      - Apple Silicon Mac (M1/M2/M3/M4) or Intel with Metal GPU
-      - SHA256.metal shader file in current directory
-    
-    \(Colors.dim)This is a solo miner - you only win if you find a block.
-    Current block reward: ~3.125 BTC (~$270,000)\(Colors.reset)
-    """)
+    print("Usage: BTCMiner <BTC_ADDRESS>")
     exit(1)
 }
 
 let address = args[1]
+setbuf(stdout, nil)  // Disable output buffering
+print("\(Colors.gold)₿ Bitcoin Lottery Miner v7.4 - Metal GPU Edition\(Colors.reset)")
+print("\(Colors.dim)  Same layout as v6.3 Python miner\(Colors.reset)\n")
 
-print("\(Colors.gold)₿ MacMetal Miner v1.0 - Native Metal GPU Bitcoin Miner\(Colors.reset)")
-print("\(Colors.dim)  The first open-source Metal GPU Bitcoin miner for Apple Silicon\(Colors.reset)\n")
-
-// Initialize miner
 guard let miner = BitcoinMiner(address: address) else {
-    print("\(Colors.red)❌ Failed to initialize miner\(Colors.reset)")
+    print("❌ Failed to initialize miner")
     exit(1)
 }
 
-// Handle Ctrl+C gracefully
 signal(SIGINT) { _ in
     print("\n\(Colors.showCursor)")
     print("\(Colors.gold)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\(Colors.reset)")
     print("  \(Colors.bold)SESSION COMPLETE 🏁\(Colors.reset)")
     print("\(Colors.gold)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\(Colors.reset)")
-    print("  \(Colors.pink)🎰 Thanks for mining! HODL! 💎🙌\(Colors.reset)\n")
+    print("  \(Colors.pink)🎰 HODL! 💎🙌\(Colors.reset)\n")
     exit(0)
 }
 
-// Start mining!
 miner.run()
