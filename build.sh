@@ -39,7 +39,6 @@ echo "Compiling..."
 swiftc -O -o BTCMiner main.swift \
     -framework Metal \
     -framework Foundation \
-    -framework Network \
     -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker /dev/null
 
 # Check result
